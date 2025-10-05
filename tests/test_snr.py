@@ -1,7 +1,8 @@
 import numpy as np
+import pytest
 
 from neurofisherSNR.optimize import initialize_C
-from neurofisherSNR.snr import SNR_bound_instantaneous
+from neurofisherSNR.snr import SNR_bound_instantaneous, SNR_bound_instantaneous_vectorized
 
 
 class TestSNRBoundInstantaneous:
@@ -82,3 +83,45 @@ class TestSNRBoundInstantaneous:
         assert np.abs(snr_dB - expected_snr_dB) < 1e-10, (
             f"SNR mismatch: computed={snr_dB:.6f}, expected={expected_snr_dB:.6f}"
         )
+
+
+@pytest.fixture
+def sample_data():
+    """Generate sample data for testing."""
+    n_timepoints = 100
+    d_latent = 5
+    d_neurons = 50
+    x = np.random.randn(n_timepoints, d_latent)
+    x -= x.mean(axis=0)
+    x /= x.std(axis=0)
+    CT = np.random.randn(d_latent, d_neurons)
+    b = np.random.randn(1, d_neurons)
+    return x, CT, b
+
+def test_snr_functions_equivalence(sample_data):
+    """Test that the vectorized and original SNR functions produce nearly identical results."""
+    x, CT, b = sample_data
+    snr_original = SNR_bound_instantaneous(x, CT, b)
+    snr_vectorized = SNR_bound_instantaneous_vectorized(x, CT, b)
+    assert np.isclose(snr_original, snr_vectorized, atol=1e-9), \
+        f"SNR values are not close. Original: {snr_original}, Vectorized: {snr_vectorized}"
+
+def test_snr_edge_cases():
+    """Test edge cases for the SNR functions."""
+    # Test with single timepoint
+    x = np.random.randn(1, 5)
+    CT = np.random.randn(5, 10)
+    b = np.random.randn(1, 10)
+    assert np.isclose(SNR_bound_instantaneous(x, CT, b), SNR_bound_instantaneous_vectorized(x, CT, b), atol=1e-9)
+
+    # Test with single neuron
+    x = np.random.randn(100, 5)
+    CT = np.random.randn(5, 1)
+    b = np.random.randn(1, 1)
+    assert np.isclose(SNR_bound_instantaneous(x, CT, b), SNR_bound_instantaneous_vectorized(x, CT, b), atol=1e-9)
+
+    # Test with single latent dimension
+    x = np.random.randn(100, 1)
+    CT = np.random.randn(1, 10)
+    b = np.random.randn(1, 10)
+    assert np.isclose(SNR_bound_instantaneous(x, CT, b), SNR_bound_instantaneous_vectorized(x, CT, b), atol=1e-9)
