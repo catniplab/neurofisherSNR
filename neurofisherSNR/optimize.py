@@ -152,6 +152,84 @@ def adjust_gain(
     return adjusted_gain, adjusted_idx
 
 
+def _logmeanexp(values: np.ndarray, axis: int) -> np.ndarray:
+    max_value = np.max(values, axis=axis, keepdims=True)
+    return np.log(np.mean(np.exp(values - max_value), axis=axis, keepdims=True)) + max_value
+
+
+def _bias_match_from_drive(
+    log_drive: np.ndarray,
+    tgt_rate_per_bin: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Match per-neuron mean firing rates for a precomputed log drive.
+
+    Parameters
+    ----------
+    log_drive : ndarray
+        Matrix ``x @ CT`` with shape ``(n_timepoints, d_neurons)``.
+    tgt_rate_per_bin : float
+        Target mean rate per time bin.
+
+    Returns
+    -------
+    tuple
+        ``(b, rates)`` with ``b`` shape ``(1, d_neurons)`` and ``rates`` shape
+        ``(n_timepoints, d_neurons)``.
+    """
+    b = np.log(float(tgt_rate_per_bin)) - _logmeanexp(log_drive, axis=0)
+    return b, np.exp(log_drive + b)
+
+
+def _row_gain_caps(
+    x: np.ndarray,
+    CT: np.ndarray,
+    tgt_rate_per_bin: float,
+    max_rate_per_bin: float,
+    max_gain: float,
+) -> np.ndarray:
+    """Return per-neuron gain caps that satisfy the max-rate constraint.
+
+    The cap is computed after bias matching, because changing the loading gain
+    changes both the rate variance and the bias required to preserve the mean.
+    """
+    log_max_rate = float(np.log(max_rate_per_bin))
+    log_drive = x @ CT
+
+    def max_log_rate_for(row_gains: np.ndarray) -> np.ndarray:
+        scaled_drive = log_drive * row_gains.reshape(1, -1)
+        b = np.log(float(tgt_rate_per_bin)) - _logmeanexp(scaled_drive, axis=0)
+        return np.max(scaled_drive + b, axis=0)
+
+    low = np.zeros(CT.shape[1], dtype=np.float64)
+    high = np.ones(CT.shape[1], dtype=np.float64)
+    max_gain = float(max_gain)
+
+    for _ in range(80):
+        max_log_rate = max_log_rate_for(high)
+        feasible = max_log_rate <= log_max_rate + 1e-10
+        expandable = feasible & (high < max_gain)
+        if not bool(np.any(expandable)):
+            break
+        low[expandable] = high[expandable]
+        high[expandable] = np.minimum(2.0 * high[expandable], max_gain)
+
+    max_log_rate = max_log_rate_for(high)
+    bounded = max_log_rate > log_max_rate + 1e-10
+    if not bool(np.any(bounded)):
+        return np.full(CT.shape[1], max_gain, dtype=np.float64)
+
+    for _ in range(50):
+        mid = 0.5 * (low + high)
+        max_log_rate = max_log_rate_for(mid)
+        too_high = bounded & (max_log_rate > log_max_rate)
+        high[too_high] = mid[too_high]
+        low[bounded & ~too_high] = mid[bounded & ~too_high]
+
+    caps = np.full(CT.shape[1], max_gain, dtype=np.float64)
+    caps[bounded] = low[bounded]
+    return caps
+
+
 def optimize_C(
     x: np.ndarray,
     C: np.ndarray,
@@ -167,27 +245,35 @@ def optimize_C(
     max_gain: float = 1.0,
     verbose: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Uniformly scale the loading matrix to match the target SNR using bisection search.
+    """Scale a loading matrix to match a target SNR.
+
+    The optimizer searches a scalar gain. With ``priority="max"``, each neuron
+    is capped at the largest row gain that satisfies ``max_rate_per_bin`` after
+    bias matching. Every candidate SNR is computed from the exact returned
+    loading and bias, so ``(C, b, achieved_snr)`` is internally consistent.
 
     Args:
-        x: The latent trajectory matrix
-        C: The loading matrix to scale
-        b: The bias vector (1, num_neurons)
-        tgt_rate_per_bin: Target firing rate per bin
-        max_rate_per_bin: Maximum firing rate per bin
-        tgt_snr: Target signal-to-noise ratio in dB
-        snr_fn: Function to compute SNR
-        max_iter: Maximum number of bisection iterations
-        tol: Relative tolerance for SNR matching (e.g., 0.1 means 10% tolerance)
-        min_gain: Initial minimum gain for search
-        max_gain: Initial maximum gain for search
-        verbose: Whether to print debug information
+        x: The latent trajectory matrix, shape ``(n_timepoints, d_latent)``.
+        C: Loading matrix, shape ``(d_neurons, d_latent)``.
+        b: Bias vector, shape ``(1, d_neurons)``. Used for shape validation;
+            the returned bias is recomputed by mean-rate matching.
+        tgt_rate_per_bin: Target mean firing rate per bin.
+        max_rate_per_bin: Maximum firing rate per bin.
+        tgt_snr: Target signal-to-noise ratio in dB.
+        snr_fn: Function to compute SNR from ``(x, C.T, b)``.
+        priority: ``"max"`` enforces the max-rate cap; ``"mean"`` performs a
+            pure scalar-gain search with mean-rate bias matching.
+        max_iter: Maximum number of bisection iterations.
+        tol: Relative tolerance for SNR matching.
+        min_gain: Initial minimum scalar gain for search.
+        max_gain: Initial maximum scalar gain for search.
+        verbose: Whether to print debug information.
 
     Returns:
-        Tuple of (scaled_C, updated_b, achieved_snr)
+        Tuple of ``(scaled_C, updated_b, achieved_snr)``.
 
     Raises:
-        ValueError: If tgt_snr is invalid or if search fails to converge
+        ValueError: If arguments are invalid or no finite candidate is found.
     """
     assert isinstance(x, np.ndarray) and x.ndim == 2, "x must be 2D ndarray"
     assert isinstance(C, np.ndarray) and C.ndim == 2, "C must be 2D ndarray"
@@ -197,127 +283,126 @@ def optimize_C(
     assert (
         isinstance(b, np.ndarray) and b.ndim == 2 and b.shape[0] == 1
     ), "b must be 2D ndarray (1, num_neurons)"
+    assert x.shape[1] == C.shape[1], "x and C must have matching latent dimensions"
+    assert b.shape[1] == C.shape[0], "b and C must have matching neuron dimensions"
     assert tgt_rate_per_bin > 0.0, "tgt_rate_per_bin must be positive"
     assert max_rate_per_bin > 0.0, "max_rate_per_bin must be positive"
+    assert tgt_rate_per_bin <= max_rate_per_bin, (
+        "tgt_rate_per_bin must be no larger than max_rate_per_bin"
+    )
     assert isinstance(tgt_snr, float) or isinstance(
         tgt_snr, int
     ), "tgt_snr must be float or int"
     assert callable(snr_fn), "snr_fn must be callable"
     assert isinstance(priority, str), "priority must be a string"
+    if priority not in {"mean", "max"}:
+        raise ValueError(f"priority must be 'mean' or 'max', got {priority!r}")
     assert (
         isinstance(max_iter, int) and max_iter > 0
     ), "max_iter must be positive integer"
     assert 0.0 < tol < 1.0, "tol must be between 0 and 1"
     assert min_gain > 0.0 and max_gain > 0.0, "gains must be positive"
 
-    if tol <= 0.0 or tol >= 1.0:
-        raise ValueError("Tolerance must be between 0 and 1")
+    CT = C.T.astype(np.float64, copy=True)
+    initial_min_gain = float(min_gain)
+    initial_max_gain = float(max_gain)
+    max_search_gain = max(initial_min_gain, initial_max_gain, 1.0) * 2.0 ** max(
+        int(max_iter), 10
+    )
+    row_caps = (
+        _row_gain_caps(
+            x,
+            CT,
+            float(tgt_rate_per_bin),
+            float(max_rate_per_bin),
+            max_search_gain,
+        )
+        if priority == "max"
+        else np.full(CT.shape[1], max_search_gain, dtype=np.float64)
+    )
 
-    # Initial bounds for gain
-    curr_min_gain = min_gain
-    curr_max_gain = max_gain
-    CT = C.T
+    def evaluate(scalar_gain: float) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+        row_gains = np.minimum(float(scalar_gain), row_caps)
+        curr_CT = CT * row_gains.reshape(1, -1)
+        curr_b, _rates = _bias_match_from_drive(x @ curr_CT, float(tgt_rate_per_bin))
+        curr_snr = float(snr_fn(x, curr_CT, curr_b))
+        return curr_CT, curr_b, curr_snr, row_gains
 
-    prev_snr = -float("inf")
-    # Find initial bounds that contain the solution
-    for _ in range(10):  # Limit initial search iterations
-        try:
-            b_tmp, _ = bias_matching_firing_rate(
-                x, CT * curr_max_gain, b, tgt_rate=tgt_rate_per_bin
-            )
-            snr = snr_fn(x, CT * curr_max_gain, b_tmp)
-            if snr > tgt_snr or snr < prev_snr:
+    def update_best(candidate, best):
+        if not np.isfinite(candidate[2]):
+            return best
+        if best is None or abs(candidate[2] - tgt_snr) < abs(best[2] - tgt_snr):
+            return candidate
+        return best
+
+    try:
+        low_gain = initial_min_gain
+        low = evaluate(low_gain)
+        best = update_best(low, None)
+        for _ in range(max_iter):
+            if low[2] <= tgt_snr or low_gain <= 1e-12:
                 break
-        except np.linalg.LinAlgError:
-            curr_max_gain *= 0.8
-            break
-        curr_max_gain *= 2.0
-        prev_snr = snr
+            low_gain *= 0.5
+            low = evaluate(low_gain)
+            best = update_best(low, best)
 
-    prev_snr = float("inf")
-    for _ in range(10):  # Limit initial search iterations
-        try:
-            b_tmp, _ = bias_matching_firing_rate(
-                x, CT * curr_max_gain, b, tgt_rate=tgt_rate_per_bin
-            )
-            snr = snr_fn(x, CT * curr_min_gain, b_tmp)
-            if snr < tgt_snr or snr > prev_snr:
+        high_gain = initial_max_gain
+        high = evaluate(high_gain)
+        best = update_best(high, best)
+        for _ in range(max_iter):
+            if high[2] >= tgt_snr or high_gain >= max_search_gain:
                 break
-        except np.linalg.LinAlgError:
-            pass  # If singular, try smaller gain
-        curr_min_gain *= 0.5
-        prev_snr = snr
+            high_gain = min(2.0 * high_gain, max_search_gain)
+            high = evaluate(high_gain)
+            best = update_best(high, best)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("Failed to evaluate initial SNR search bounds") from exc
 
-    # Bisection search
-    best_snr = float("inf")
-    best_gain = None
-    best_b = None
-    curr_b = b
+    if best is None:
+        raise ValueError(f"Failed to find solution for target SNR {tgt_snr} dB")
+    if low[2] >= tgt_snr or high[2] <= tgt_snr:
+        if verbose:
+            print(
+                f"Target SNR {tgt_snr:.2f} dB is outside feasible range; "
+                f"using SNR = {best[2]:.2f} dB"
+            )
+        return best[0].T, best[1], best[2]
+
+    denom = max(abs(float(tgt_snr)), 1e-12)
     for i in range(max_iter):
-        # curr_gain = (curr_min_gain + curr_max_gain) / 2
-        curr_gain = np.sqrt(curr_min_gain * curr_max_gain)
+        curr_gain = np.sqrt(low_gain * high_gain)
         try:
-            adjusted_gain, adjusted_idx = adjust_gain(
-                x, CT, curr_b, curr_gain, tgt_rate_per_bin, max_rate_per_bin
+            current = evaluate(curr_gain)
+        except np.linalg.LinAlgError:
+            high_gain = curr_gain
+            continue
+        best = update_best(current, best)
+        rel_err = abs(current[2] - tgt_snr) / denom
+        if verbose:
+            capped = current[3] < curr_gain
+            print(
+                f"SNR: {current[2]:.2f} dB, Gain: {curr_gain:.2f}, "
+                f"Adjusted neurons: {int(capped.sum())}"
             )
-            curr_CT = CT * adjusted_gain
-            curr_b, _ = bias_matching_firing_rate(
-                x, curr_CT, b, tgt_rate=tgt_rate_per_bin
-            )
-            snr = snr_fn(x, curr_CT, curr_b)
-            if priority == "max":
-                recalibrated_gain, _ = adjust_gain(
-                    x, curr_CT, curr_b, 1, tgt_rate_per_bin, max_rate_per_bin
-                )
-                adjusted_gain = adjusted_gain * recalibrated_gain
-
+        if rel_err <= tol:
             if verbose:
                 print(
-                    f"SNR: {snr:.2f} dB, Gain: {curr_gain:.2f}, Adjusted neurons: {adjusted_idx.sum()}"
+                    f"Converged after {i + 1} iterations with relative error {rel_err:.2%}"
                 )
-            # Keep track of best solution
-            if abs(snr - tgt_snr) < abs(best_snr - tgt_snr):
-                best_snr = snr
-                best_gain = adjusted_gain
-                best_b = curr_b
-
-            # Check for convergence
-            rel_err = abs(snr - tgt_snr) / abs(tgt_snr)
-            if rel_err <= tol:
-                if verbose:
-                    print(
-                        f"Converged after {i + 1} iterations with relative error {rel_err:.2%}"
-                    )
-                return (CT * adjusted_gain).T, curr_b, snr
-
-            # Update search bounds
-            curr_min_gain = curr_gain
-        except np.linalg.LinAlgError:
-            # If singular, try smaller gain
-            curr_max_gain = curr_gain
-            continue
-
-        # Check if search bounds are too close
-        if (curr_max_gain - curr_min_gain) / curr_min_gain < 1e-6:
-            if verbose:
-                print(f"Search bounds converged after {i + 1} iterations")
+            return current[0].T, current[1], current[2]
+        if current[2] < tgt_snr:
+            low_gain = curr_gain
+        else:
+            high_gain = curr_gain
+        if (high_gain - low_gain) / low_gain < 1e-6:
             break
-        if adjusted_gain.max() < curr_gain:
-            curr_max_gain = adjusted_gain.max()
 
-    # If we didn't find a solution within tolerance, use the best one found
-    if best_gain is not None:
+    if verbose:
         print(
-            f"Could not find solution for target SNR {tgt_snr} dB, using best solution found: SNR = {best_snr:.2f} dB"
+            f"Could not find solution for target SNR {tgt_snr} dB, "
+            f"using best solution found: SNR = {best[2]:.2f} dB"
         )
-        if priority == "mean":
-            best_b, _ = bias_matching_firing_rate(
-                x, CT * best_gain, best_b, tgt_rate_per_bin
-            )
-
-        return (CT * best_gain).T, best_b, best_snr
-
-    raise ValueError(f"Failed to find solution for target SNR {tgt_snr} dB")
+    return best[0].T, best[1], best[2]
 
 
 def initialize_C(

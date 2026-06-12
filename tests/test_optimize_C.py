@@ -5,6 +5,7 @@ import pytest
 
 from neurofisherSNR.optimize import initialize_C, optimize_C
 from neurofisherSNR.snr import SNR_bound_instantaneous
+from neurofisherSNR.utils import compute_firing_rate
 
 
 class TestOptimizeCDimensions:
@@ -220,6 +221,35 @@ class TestOptimizeCDimensions:
         assert (
             updated_b.shape == self.b.shape
         ), f"updated_b shape {updated_b.shape} should match input b shape {self.b.shape}"
+
+
+    def test_optimize_C_priority_max_returns_consistent_rates_and_snr(self):
+        """Returned C, b, and SNR should describe the same capped model."""
+        scaled_C, updated_b, achieved_snr = optimize_C(
+            x=self.x,
+            C=self.C,
+            b=self.b,
+            tgt_rate_per_bin=self.tgt_rate_per_bin,
+            max_rate_per_bin=0.25,
+            tgt_snr=self.tgt_snr,
+            snr_fn=SNR_bound_instantaneous,
+            priority="max",
+            min_gain=0.01,
+            tol=1e-4,
+            verbose=False,
+        )
+
+        rates = compute_firing_rate(self.x, scaled_C.T, updated_b)
+        recomputed_snr = SNR_bound_instantaneous(self.x, scaled_C.T, updated_b)
+
+        np.testing.assert_allclose(
+            rates.mean(axis=0),
+            self.tgt_rate_per_bin,
+            rtol=1e-6,
+            atol=1e-8,
+        )
+        assert float(rates.max()) <= 0.25 + 1e-8
+        assert recomputed_snr == pytest.approx(achieved_snr, abs=1e-8)
 
 
 if __name__ == "__main__":
